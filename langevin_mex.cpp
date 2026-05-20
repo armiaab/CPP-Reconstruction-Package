@@ -32,16 +32,18 @@ static std::string _opts(int nr, const mxArray **pr, int i0, const char *k, cons
 }
 
 static LC_SplineType _sp(char c) {
-    switch (c) {
+    switch (tolower(c)) {
         case 'l': return LC_LINEAR;
         case 'c': return LC_CUBIC;
+        case 'q': return LC_CUBIC;  // Q (order-3 B-spline) mapped to cubic
         case 'p': return LC_PCHIP;
         default:  return LC_CUBIC;
     }
 }
 static LC_Solver _slv(const std::string &s) {
-    if (s == "lbfgs") return LC_LBFGS;
-    if (s == "isres") return LC_ISRES;
+    if (s == "lbfgs")                         return LC_LBFGS;
+    if (s == "isres" || s == "gwo")           return LC_ISRES;
+    // fmincon / slsqp / ps / anything else → SLSQP
     return LC_SLSQP;
 }
 
@@ -76,7 +78,9 @@ void mexFunction(int nlhs, mxArray *plhs[],
 
         LC_Solver solver = _slv(_opts(nrhs, prhs, opt0, "solver", "slsqp"));
 
-        int    nstarts = _opti(nrhs, prhs, opt0, "nstarts", 1);
+        // 'search_agents' is the original package name; 'nstarts' is our alias
+        int nstarts = _opti(nrhs, prhs, opt0, "nstarts", -1);
+        if (nstarts < 0) nstarts = _opti(nrhs, prhs, opt0, "search_agents", 1);
         int    maxiter = _opti(nrhs, prhs, opt0, "maxiter", 10000);
         double ftol    = _optd(nrhs, prhs, opt0, "ftol",    1e-9);
         double L       = _optd(nrhs, prhs, opt0, "l",       (double)NAN);

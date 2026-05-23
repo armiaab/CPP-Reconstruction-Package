@@ -10,6 +10,7 @@ extern "C" {
 extern const gsl_interp_type *gsl_interp_linear;
 extern const gsl_interp_type *gsl_interp_cspline;
 extern const gsl_interp_type *gsl_interp_steffen;
+extern const gsl_interp_type *gsl_interp_quadratic;  /* piecewise-quadratic, d(x0)=0 BC */
 
 gsl_interp_accel *gsl_interp_accel_alloc(void);
 void              gsl_interp_accel_free(gsl_interp_accel *a);

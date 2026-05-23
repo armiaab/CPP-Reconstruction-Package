@@ -35,7 +35,7 @@ static LC_SplineType _sp(char c) {
     switch (tolower(c)) {
         case 'l': return LC_LINEAR;
         case 'c': return LC_CUBIC;
-        case 'q': return LC_CUBIC;  // Q (order-3 B-spline) mapped to cubic
+        case 'q': return LC_QUADRATIC;   /* piecewise-quadratic, matches MATLAB 'Q' */
         case 'p': return LC_PCHIP;
         default:  return LC_CUBIC;
     }

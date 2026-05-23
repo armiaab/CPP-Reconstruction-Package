@@ -65,3 +65,10 @@ target_link_libraries(langevin_core
         Eigen3::Eigen
 )
 
+# Verification test executable
+add_executable(test_euler test_euler.cpp)
+target_link_libraries(test_euler PRIVATE langevin_core)
+if(MSVC)
+    target_compile_definitions(test_euler PRIVATE _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS)
+endif()
+

@@ -35,10 +35,11 @@ static void _gsl_init() {
 
 static const gsl_interp_type *_gsl_itype(LC_SplineType sp) {
     switch (sp) {
-        case LC_LINEAR: return gsl_interp_linear;
-        case LC_CUBIC:  return gsl_interp_cspline;
-        case LC_PCHIP:  return gsl_interp_steffen;
-        default:        return gsl_interp_linear;
+        case LC_LINEAR:    return gsl_interp_linear;
+        case LC_CUBIC:     return gsl_interp_cspline;
+        case LC_PCHIP:     return gsl_interp_steffen;
+        case LC_QUADRATIC: return gsl_interp_quadratic;
+        default:           return gsl_interp_linear;
     }
 }
 
@@ -204,9 +205,11 @@ struct Prob {
     {
         nll_const = (double)nd_ * (0.5 * std::log(dt_) + LOG_SQRT_2PI);
 
+        /* Quadratic splines are also linear in their knot-value parameters,
+         * so the basis-matrix analytic gradient path applies to them too. */
         analytic_grad =
-            (sm_ == LC_LINEAR || sm_ == LC_CUBIC || sm_ == LC_ADDITIVE) &&
-            (ss_ == LC_LINEAR || ss_ == LC_CUBIC || ss_ == LC_ADDITIVE);
+            (sm_ == LC_LINEAR || sm_ == LC_CUBIC || sm_ == LC_QUADRATIC || sm_ == LC_ADDITIVE) &&
+            (ss_ == LC_LINEAR || ss_ == LC_CUBIC || ss_ == LC_QUADRATIC || ss_ == LC_ADDITIVE);
 
         if (analytic_grad) {
             B_mu  = _build_basis_matrix(km_, (int)nm_, sm_, X0_, nd_);
@@ -360,6 +363,10 @@ static void _preprocess(const double *data, int n, double L, double R,
     }
 }
 
+/* Build nk equally-spaced knots over [L,R].
+ * When L/R are specified (finite) use them exactly (matching MATLAB linspace(L,R,nk)).
+ * When L/R are NaN/inf, fall back to [min(data), max(data)] — also no margin,
+ * consistent with MATLAB's default of min(data) / max(data). */
 static std::vector<double> _auto_knots(const double *data, int n,
                                         double L, double R, int nk)
 {
@@ -370,12 +377,11 @@ static std::vector<double> _auto_knots(const double *data, int n,
         lo = 1e300; hi = -1e300;
         for (int i = 0; i < n; ++i) {
             if (!std::isfinite(data[i])) continue;
-            if (data[i] < lo) lo = data[i];
-            if (data[i] > hi) hi = data[i];
+            lo = std::min(lo, data[i]);
+            hi = std::max(hi, data[i]);
         }
     }
-    double m = (hi - lo) * 0.02;
-    lo -= m; hi += m;
+    /* No margin — use exact linspace(lo, hi, nk) matching MATLAB behaviour */
     std::vector<double> k(nk);
     for (int i = 0; i < nk; ++i)
         k[i] = lo + (hi - lo) * i / (nk - 1.0);
@@ -394,23 +400,28 @@ static void _auto_bounds(int nm, int ns, LC_SplineType ss,
     std::fill(ub.begin() + nm, ub.end(),  10.0);
 }
 
+/* Check that sigma is strictly positive across the fine grid.
+ * Uses gsl_spline_eval directly so it works for all spline types
+ * including LC_QUADRATIC (PPoly only handled linear/cubic). */
 static bool _sigma_ok(const double *par, size_t nm, size_t ns,
                        LC_SplineType ss, const double *ks,
                        const double *fine, size_t nf)
 {
     if (ss == LC_ADDITIVE) return par[nm] > 0.0;
 
-    gsl_spline *spl = gsl_spline_alloc(_gsl_itype(ss), ns);
+    gsl_spline       *spl = gsl_spline_alloc(_gsl_itype(ss), ns);
+    gsl_interp_accel *acc = gsl_interp_accel_alloc();
     gsl_spline_init(spl, ks, par + nm, ns);
-    PPoly pp;
-    _build_pp(spl, ks, par + nm, ns, ss, pp);
-    gsl_spline_free(spl);
 
-    std::vector<double> out(nf);
-    _eval_pp(pp, fine, nf, out.data());
-    for (double v : out)
-        if (!std::isfinite(v) || v <= 0.0) return false;
-    return true;
+    bool ok = true;
+    for (size_t i = 0; i < nf; ++i) {
+        double v = gsl_spline_eval(spl, fine[i], acc);
+        if (!std::isfinite(v) || v <= 0.0) { ok = false; break; }
+    }
+
+    gsl_interp_accel_free(acc);
+    gsl_spline_free(spl);
+    return ok;
 }
 
 extern "C"

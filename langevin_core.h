@@ -18,10 +18,11 @@ extern "C" {
 #endif
 
 typedef enum {
-    LC_LINEAR   = 0,
-    LC_CUBIC    = 1,
-    LC_PCHIP    = 2,
-    LC_ADDITIVE = 3
+    LC_LINEAR    = 0,
+    LC_CUBIC     = 1,
+    LC_PCHIP     = 2,
+    LC_ADDITIVE  = 3,
+    LC_QUADRATIC = 4   /* piecewise-quadratic interpolating spline, 'Q' in MATLAB */
 } LC_SplineType;
 
 typedef enum {

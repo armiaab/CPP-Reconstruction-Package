@@ -15,13 +15,15 @@
 extern "C" gsl_error_handler_t gsl_set_error_handler(gsl_error_handler_t h)
 { (void)h; return nullptr; }
 
-static const gsl_interp_type _linear  = {0, "linear"};
-static const gsl_interp_type _cspline = {1, "cspline"};
-static const gsl_interp_type _steffen = {2, "steffen"};
+static const gsl_interp_type _linear    = {0, "linear"};
+static const gsl_interp_type _cspline   = {1, "cspline"};
+static const gsl_interp_type _steffen   = {2, "steffen"};
+static const gsl_interp_type _quadratic = {3, "quadratic"};
 
-const gsl_interp_type *gsl_interp_linear  = &_linear;
-const gsl_interp_type *gsl_interp_cspline = &_cspline;
-const gsl_interp_type *gsl_interp_steffen = &_steffen;
+const gsl_interp_type *gsl_interp_linear    = &_linear;
+const gsl_interp_type *gsl_interp_cspline   = &_cspline;
+const gsl_interp_type *gsl_interp_steffen   = &_steffen;
+const gsl_interp_type *gsl_interp_quadratic = &_quadratic;
 
 extern "C" gsl_interp_accel *gsl_interp_accel_alloc(void) {
     gsl_interp_accel *a = (gsl_interp_accel*)std::malloc(sizeof(gsl_interp_accel));
@@ -130,6 +132,43 @@ static void linear_derivs(const double *x, const double *y,
     dy[n-1] = dy[n-2];
 }
 
+/*
+ * Quadratic interpolating spline (piecewise quadratic, C1 continuous).
+ * On each interval [x_k, x_{k+1}]:
+ *   q_k(t) = y_k + d_k * t + c_k * t^2,   t = x - x_k
+ * where d_k = dy[k] is the derivative stored at the LEFT end of interval k.
+ *
+ * Recurrence with natural left-endpoint BC (d_0 = 0):
+ *   Delta_k = (y_{k+1} - y_k) / h_k
+ *   d_{k+1} = 2 * Delta_k - d_k
+ *
+ * c_k is not stored; it is recomputed on-the-fly during evaluation:
+ *   c_k = (Delta_k - d_k) / h_k
+ *
+ * dy[k] holds the derivative at x_k for k = 0 ... n-1.
+ * dy[n-1] is the derivative at the final knot (from the last interval's right end).
+ */
+static void quadratic_derivs(const double *x, const double *y,
+                              size_t n, double *dy)
+{
+    if (n == 0) return;
+    if (n == 1) { dy[0] = 0.0; return; }
+    if (n == 2) {
+        dy[0] = 0.0;
+        double h = x[1] - x[0];
+        double delta = (y[1] - y[0]) / h;
+        dy[1] = 2.0*delta - dy[0];
+        return;
+    }
+
+    dy[0] = 0.0;  /* natural BC: zero derivative at left endpoint */
+    for (size_t k = 0; k < n-1; ++k) {
+        double h     = x[k+1] - x[k];
+        double delta = (y[k+1] - y[k]) / h;
+        dy[k+1] = 2.0 * delta - dy[k];
+    }
+}
+
 extern "C" {
 
 gsl_spline *gsl_spline_alloc(const gsl_interp_type *type, size_t n) {
@@ -155,9 +194,10 @@ int gsl_spline_init(gsl_spline *spl,
     std::memcpy(spl->xa, xa, n * sizeof(double));
     std::memcpy(spl->ya, ya, n * sizeof(double));
     switch (spl->type->id) {
-        case 1:  cspline_derivs(xa, ya, n, spl->dy); break;
-        case 2:  steffen_derivs(xa, ya, n, spl->dy); break;
-        default: linear_derivs (xa, ya, n, spl->dy); break;
+        case 1:  cspline_derivs  (xa, ya, n, spl->dy); break;
+        case 2:  steffen_derivs  (xa, ya, n, spl->dy); break;
+        case 3:  quadratic_derivs(xa, ya, n, spl->dy); break;
+        default: linear_derivs   (xa, ya, n, spl->dy); break;
     }
     return GSL_SUCCESS;
 }
@@ -180,9 +220,17 @@ double gsl_spline_eval(const gsl_spline *spl, double x, gsl_interp_accel *)
     double h  = spl->xa[k+1] - spl->xa[k];
     double t  = x - spl->xa[k];
 
-    if (spl->type->id == 0)
+    if (spl->type->id == 0)          /* linear */
         return spl->ya[k] + t * spl->dy[k];
 
+    if (spl->type->id == 3) {       /* quadratic: q(t) = y0 + d0*t + ck*t^2 */
+        double y0 = spl->ya[k];
+        double d0 = spl->dy[k];
+        double ck = ((spl->ya[k+1] - y0) / h - d0) / h;
+        return y0 + t*(d0 + t*ck);
+    }
+
+    /* cubic / Steffen Hermite */
     double y0 = spl->ya[k],  y1 = spl->ya[k+1];
     double d0 = spl->dy[k],  d1 = spl->dy[k+1];
     double c  = (3.0*(y1-y0)/h - 2.0*d0 - d1) / h;

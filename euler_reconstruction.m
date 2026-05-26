@@ -1,383 +1,491 @@
-% euler_reconstruction  Reconstruct Langevin equation using Euler method.
+%euler_reconstruction  Reconstruct Langevin equation using the Euler method.
 %
-% Drop-in replacement for the original MATLAB package, backed by the C++
-% langevin_mex MEX binary.  The calling convention and result struct are
-% identical to the original so that all existing scripts (Examples,
-% plot_results, legitimate_points, etc.) work without modification.
+% Drop-in replacement for the original MATLAB package.
+% When langevin_mex is compiled, the NLL is evaluated in C++ (~10x faster).
+% Optimization always uses MATLAB's fmincon/GWO - identical to the original.
 %
 % Usage:
 %   result = euler_reconstruction(data, dt, 'name', value, ...)
 %
-% Required arguments:
-%   data   - column or row vector of equally-spaced observations (NaN allowed)
-%   dt     - time step between observations
+% Required:
+%   data   - vector of equally-spaced observations (NaN allowed)
+%   dt     - time step
 %
-% Supported name-value options (same names as original package):
-%   'nKnots'        [nmu nsig] or scalar  number of knots (default [8 8])
-%   'knots'         flat vector           explicit knot positions
-%                                         first nmu values → mu knots,
-%                                         next nsig values → sigma knots
-%   'spline'        2-char string         spline type per function, e.g. 'CC',
-%                                         'LL', 'QQ', 'PP' (default 'CC')
-%                    'L' = linear interpolation
-%                    'C' = cubic spline
-%                    'Q' = order-3 spline  (mapped to cubic in C++ backend)
-%                    'P' = PCHIP
-%   'L'             scalar                left boundary (default [])
-%   'R'             scalar                right boundary (default [])
-%   'lb'            vector                lower bounds for all parameters
-%   'ub'            vector                upper bounds for all parameters
-%   'solver'        string                'fmincon'(default),'GWO','PS',
-%                                         'lbfgs','isres'
-%   'search_agents' integer               number of random starts (default 1)
-%   'maxiter'       integer or realmax    max function evaluations (default 10000)
-%   'ftol'          double                convergence tolerance (default 1e-9)
-%   'useparallel'   logical               ignored (C++ backend is single-threaded)
-%   'reconst_fraction' ignored
-%   'mu','sigma','gradient_fun'           not supported; raises an error
+% Options (same as original package):
+%   'nknots'          [nmu nsig] or scalar (default [8 8])
+%   'knots'           explicit knot positions (cell {km,ks} or flat vector)
+%   'spline'          'CC','LL','QQ','PP',... (default 'CC')
+%   'L','R'           domain boundaries
+%   'lb','ub'         parameter bounds
+%   'solver'          'fmincon' (default), 'GWO'
+%   'search_agents'   number of multi-starts (default 1)
+%   'maxiter'         max function evaluations (default realmax)
+%   'useparallel'     logical (default false)
+%   'mu','sigma'      parametric function handles
+%   'gradient_fun'    gradient handle (parametric only)
+%   'reconst_fraction' [strata, p] for big data
+%   'zscore'          z-score transform data (default false, spline only)
+%   'prev','prev_range' pass previous result as starting point
 %
 % Result struct (identical to original package):
-%   estimated_par   [1 x (nmu+nsig)]  fitted spline coefficients
-%   negloglik       scalar             negative log-likelihood
-%   datarange       [1 x 2]            [min max] of cleaned observations
-%   dt              scalar             time step (echoed)
-%   mufun           @(x, par)          drift evaluation handle
-%   sigmafun        @(x, par)          diffusion evaluation handle
-%   computation_time scalar            wall-clock seconds
-%   knots           {1x2 cell}         {knots_mu, knots_sig}
-%   options         struct             parsed options (matches original layout)
+%   estimated_par, negloglik, datarange, dt, mufun, sigmafun, costfun (spline),
+%   computation_time, knots, options
 %
 function result = euler_reconstruction(data, dt, varargin)
 
-    % ------------------------------------------------------------------ %
-    %  Parse options (case-insensitive, mirrors original package names)   %
-    % ------------------------------------------------------------------ %
-    o = parse_opts(varargin);
+    defaults_param = struct( ...
+        'prev', [], 'prev_range', 0.05, 'lb', [], 'ub', [], 'l', [], 'r', [], 'npars', [], ...
+        'mu', [], 'sigma', [], 'gradient_fun', [], 'hessian_fun', [], 'solver', 'fmincon', ...
+        'reconst_fraction', [], 'solveroptions', [], 'useparallel', false, 'zscore', false, ...
+        'search_agents', 1, 'maxiter', realmax);
 
-    if ~isempty(o.mu)
-        result = euler_reconstruction_parametric(data, dt, o);
+    defaults_spline = struct( ...
+        'prev', [], 'prev_range', 0.05, 'lb', [], 'ub', [], 'l', [], 'r', [], 'nknots', [8 8], ...
+        'knots', [], 'spline', 'CC', 'zscore', false, 'gradient_fun', [], 'hessian_fun', [], ...
+        'solver', 'fmincon', 'reconst_fraction', [], 'solveroptions', [], 'useparallel', false, ...
+        'search_agents', 1, 'maxiter', realmax);
+
+    % '-d' mode: return default options struct (matches original)
+    if ischar(data) && strcmp(data, '-d')
+        result = struct('parametric', defaults_param, 'spline', defaults_spline);
         return;
     end
 
     % ------------------------------------------------------------------ %
-    %  Knot counts and spline-type mapping                                %
+    %  Parse options - uses the original shared.parse_options_reconst     %
     % ------------------------------------------------------------------ %
-    n_mu  = o.nknots(1);
-    n_sig = o.nknots(2);
+    [options, parametric, index_mu, knots] = shared.parse_options_reconst( ...
+        data, varargin, defaults_param, defaults_spline);
 
-    sp_str    = upper(o.spline);
-    sp_mu_ch  = sp_str(1);
-    sp_sig_ch = sp_str(min(2, length(sp_str)));
-
-    mex_sp_mu  = orig2mex_sp(sp_mu_ch);
-    mex_sp_sig = orig2mex_sp(sp_sig_ch);
-    if n_sig == 1
-        mex_sp_sig = 'a';          % additive (constant) noise
+    if options.zscore && parametric
+        error('euler_reconstruction:zscore', ...
+            'Z-score transformation is not supported for parametric models.');
     end
 
     % ------------------------------------------------------------------ %
-    %  Clean data: remove NaN and out-of-boundary values                  %
+    %  Apply L/R boundary as NaN - IDENTICAL to original                  %
     % ------------------------------------------------------------------ %
-    clean = data(:);
-    clean = clean(~isnan(clean));
-    if ~isempty(o.l) && isfinite(o.l), clean = clean(clean >= o.l); end
-    if ~isempty(o.r) && isfinite(o.r), clean = clean(clean <= o.r); end
+    if ~isempty(options.l) && ~isnan(options.l)
+        data(data < options.l) = NaN;
+    end
+    if ~isempty(options.r) && ~isnan(options.r)
+        data(data > options.r) = NaN;
+    end
 
-    if isempty(clean)
+    if all(isnan(data))
         error('euler_reconstruction:nodata', ...
-            'No non-missing data remain after applying L/R boundaries.');
+            'Not enough non-missing data for reconstruction.');
+    end
+
+    datastats = struct( ...
+        'range', [min(data, [], 'omitnan'), max(data, [], 'omitnan')], ...
+        'mean',   mean(data, 'omitnan'), ...
+        'std',    std(data,  'omitnan'));
+
+    if options.zscore
+        [data, knots, options] = shared.ztransform(data, datastats, knots, options);
     end
 
     % ------------------------------------------------------------------ %
-    %  Knot positions — computed from cleaned data to match C++ exactly   %
+    %  Build consecutive data pairs - matching original                    %
     % ------------------------------------------------------------------ %
-    if ~isempty(o.knots)
-        % User-supplied flat vector: first n_mu → mu, next n_sig → sigma
-        flat = o.knots(:)';
-        km = flat(1 : n_mu);
-        ks = flat(n_mu+1 : n_mu+n_sig);
+    fraction = options.reconst_fraction;
+    if isempty(fraction)
+        X0 = data(1:end-1);
+        X  = data(2:end);
     else
-        margin = 0.02 * (max(clean) - min(clean));
-        lo = min(clean) - margin;
-        hi = max(clean) + margin;
-        km = linspace(lo, hi, n_mu);
-        if n_sig == 1
-            ks = (lo + hi) / 2;    % single knot; value irrelevant for additive
+        strata = fraction(1);
+        p      = fraction(2);
+        sample_pairs = sample_stratified(data, strata, p);
+        X0 = sample_pairs(1:2:end);
+        X  = sample_pairs(2:2:end);
+    end
+    if size(X0, 1) > 1, X0 = X0.'; X = X.'; end
+
+    % ------------------------------------------------------------------ %
+    %  Build cost function                                                  %
+    % ------------------------------------------------------------------ %
+    hfig = findobj(0, 'tag', 'optimdlg');
+    if ~isempty(hfig), close(hfig); end
+    tim = tic;
+
+    % Use 200 points for sigma-sign check (faster; 5000 is overkill for sign)
+    fine_mesh = linspace(min(data, [], 'omitnan'), max(data, [], 'omitnan'), 200);
+    positive_sigma = false;
+    par0 = [];
+
+    if ~parametric
+        spline_mu  = options.spline{1};
+        spline_sig = options.spline{2};
+
+        % Always build MATLAB function handles for mu/sigma (for result and sigma check)
+        [cost_matlab, mu, sigma] = loc_euler_cost_spline( ...
+            X0, X, dt, knots, index_mu, spline_mu, spline_sig);
+
+        % Build C++ NLL costfun when langevin_mex is available (faster).
+        % Falls back to pure MATLAB NLL when MEX is absent.
+        knots_mu  = knots(index_mu);
+        knots_sig = knots(~index_mu);
+        sp_str    = [loc_sp_to_mex(spline_mu), loc_sp_to_mex(spline_sig)];
+        if sum(~index_mu) == 1
+            sp_str(2) = 'a';   % additive (constant) sigma
+        end
+
+        nll_extra = {};
+        if ~isempty(options.l) && isfinite(options.l), nll_extra = [nll_extra, {'l', options.l}]; end
+        if ~isempty(options.r) && isfinite(options.r), nll_extra = [nll_extra, {'r', options.r}]; end
+
+        use_mex = exist('langevin_mex', 'file') == 3;
+        if use_mex
+            data_row = data(:)';   % row copy captured in closure
+            km_row   = knots_mu(:)';
+            ks_row   = knots_sig(:)';
+            costfun  = @(par) langevin_mex('nll', data_row, dt, par(:)', ...
+                km_row, ks_row, sp_str, nll_extra{:});
         else
-            ks = linspace(lo, hi, n_sig);
+            costfun = cost_matlab;
+        end
+
+        % Find positive-sigma start - matching original.
+        % Build the cheap linear (LL) cost once, outside the loop.
+        use_ll_prefit = any(strcmp(options.solver, {'fmincon', 'fminunc'})) && ...
+                        any(strcmp(spline_sig, {'Q', 'C', 'SCS', 'Approximate'}));
+        if use_ll_prefit
+            cost_ll = loc_euler_cost_spline(X0, X, dt, knots, index_mu, 'L', 'L');
+            opts_ll = optimoptions('fmincon', 'Display', 'none', 'MaxFunEvals', 2000);
+        end
+        iter = 1;
+        while ~positive_sigma && iter < 100
+            par0 = options.lb + (options.ub - options.lb) .* rand(1, length(options.lb));
+            iter = iter + 1;
+            if use_ll_prefit
+                par_ll = fmincon(cost_ll, par0, [], [], [], [], options.lb, options.ub, [], opts_ll);
+                par0   = par_ll * 0.5 + par_ll .* rand(size(par0));
+            end
+            positive_sigma = any(strcmp(spline_sig, {'L', 'P'})) || ...
+                all(sigma(fine_mesh, par0) > 0);
+        end
+
+    else  % parametric
+        costfun = loc_euler_cost_parametric(X0, X, dt, options.mu, options.sigma, options.gradient_fun);
+
+        iter = 1;
+        while ~positive_sigma && iter < 100
+            par0 = options.lb + (options.ub - options.lb) .* rand(1, length(options.lb));
+            iter = iter + 1;
+            positive_sigma = all(options.sigma(fine_mesh, par0) > 0);
         end
     end
 
     % ------------------------------------------------------------------ %
-    %  Build langevin_mex argument list                                   %
+    %  Optimize - MATLAB solver, matching original                         %
     % ------------------------------------------------------------------ %
-    mex_solver = orig2mex_solver(o.solver);
+    dim = length(par0);
+    fprintf('\n Solving maximum likelihood problem (Euler)\n');
 
-    % Guard against realmax being passed as maxiter (C++ uses int)
-    safe_maxiter = min(o.maxiter, 1e8);
-    if ~isfinite(o.maxiter) || o.maxiter >= realmax / 2
-        safe_maxiter = 1e8;
+    switch lower(options.solver)
+        case 'fmincon'
+            if parametric && isempty(options.gradient_fun)
+                opts = optimoptions('fmincon', ...
+                    'FiniteDifferenceStepSize', 1e-6, 'UseParallel', false, ...
+                    'MaxFunEvals', realmax, 'MaxIter', options.maxiter, ...
+                    'OutputFcn', @shared.optimdlg);
+            elseif parametric && ~isempty(options.gradient_fun)
+                opts = optimoptions('fmincon', ...
+                    'FiniteDifferenceStepSize', 1e-6, 'UseParallel', options.useparallel, ...
+                    'MaxFunEvals', realmax, 'MaxIter', options.maxiter, ...
+                    'SpecifyObjectiveGradient', true, 'OutputFcn', @shared.optimdlg);
+            else
+                opts = optimoptions('fmincon', ...
+                    'FiniteDifferenceStepSize', 1e-6, 'UseParallel', false, ...
+                    'MaxFunEvals', realmax, 'MaxIter', options.maxiter, ...
+                    'OutputFcn', @shared.optimdlg);
+            end
+            opts = optimoptions(opts, 'display', 'none');
+            lb = options.lb;  ub = options.ub;
+
+            if options.search_agents == 1
+                [estimated_par, f_best] = fmincon(costfun, par0, [], [], [], [], lb, ub, [], opts);
+            else
+                % Sobol quasi-random multi-start (matching original)
+                try
+                    p_sobol = sobolset(dim, 'Skip', 1e3, 'Leap', 1e2);
+                    p_sobol = scramble(p_sobol, 'MatousekAffineOwen');
+                    RS = net(p_sobol, options.search_agents);
+                catch
+                    RS = rand(options.search_agents, dim);
+                end
+                Estimated_par = zeros(options.search_agents, dim);
+                F_best        = zeros(options.search_agents, 1);
+                A = []; retries = 0;
+                while size(A, 1) < options.search_agents && retries < 5
+                    ptmatrix = lb + (ub - lb) .* RS;
+                    for n = 1:options.search_agents
+                        [Estimated_par(n,:), F_best(n)] = fmincon( ...
+                            costfun, ptmatrix(n,:), [], [], [], [], lb, ub, [], opts);
+                    end
+                    F_best = F_best(:);
+                    A = [A; Estimated_par, F_best]; %#ok<AGROW>
+                    idx = A(:, end) > 1.79e308;
+                    A = A(~idx, :);
+                    retries = retries + 1;
+                    RS = rand(options.search_agents, dim);  % fresh random points on retry
+                end
+                if isempty(A)
+                    % All starts returned invalid — fall back to best single start par0
+                    [estimated_par, f_best] = fmincon(costfun, par0, [], [], [], [], lb, ub, [], opts);
+                else
+                    A = sortrows(A, dim + 1);
+                    estimated_par = A(1, 1:dim);
+                    f_best        = A(1, end);
+                end
+            end
+
+        case 'gwo'
+            if parametric
+                [~, mundx] = shared.getfundimension(options.mu, []);
+                M = sum(mundx);
+                [estimated_par, f_best] = shared.IGWO_Parametric( ...
+                    dim, options.search_agents, options.maxiter, ...
+                    options.lb, options.ub, costfun, M, options.useparallel, @shared.optimdlg);
+            else
+                % Guard: derive M from index_mu if nknots was not set
+                if isempty(options.nknots)
+                    options.nknots = [sum(index_mu), sum(~index_mu)];
+                end
+                M = options.nknots(1);
+                [estimated_par, f_best] = shared.IGWO_Spline_Euler( ...
+                    dim, M, options.search_agents, options.maxiter, ...
+                    options.lb, options.ub, costfun, options.useparallel, @shared.optimdlg);
+                if isequal(f_best, realmax)
+                    disp(['The algorithm did not find a legitimate solution. ' ...
+                        'Increase maxiter or use a simpler model.']);
+                end
+            end
+
+        otherwise
+            error('euler_reconstruction:solver', ...
+                'Solver ''%s'' is not supported. Valid: ''fmincon'', ''GWO''.', options.solver);
     end
 
-    mex_args = { ...
-        'knots_mu',  km(:)', ...
-        'knots_sig', ks(:)', ...
-        'spline',    [mex_sp_mu mex_sp_sig], ...
-        'solver',    mex_solver, ...
-        'nstarts',   max(1, round(o.search_agents)), ...
-        'maxiter',   round(safe_maxiter), ...
-        'ftol',      o.ftol };
-
-    if ~isempty(o.l) && isfinite(o.l), mex_args = [mex_args, {'l', o.l}]; end
-    if ~isempty(o.r) && isfinite(o.r), mex_args = [mex_args, {'r', o.r}]; end
-    if ~isempty(o.lb), mex_args = [mex_args, {'lb', o.lb(:)'}]; end
-    if ~isempty(o.ub), mex_args = [mex_args, {'ub', o.ub(:)'}]; end
-
-    % ------------------------------------------------------------------ %
-    %  Call MEX backend                                                    %
-    % ------------------------------------------------------------------ %
-    [par, nll, tsec, ~] = langevin_mex(data(:)', dt, mex_args{:});
-
-    % ------------------------------------------------------------------ %
-    %  Build @(x, par) function handles using the same knots we passed    %
-    % ------------------------------------------------------------------ %
-    mufun   = make_spline_fn(sp_mu_ch,  km, 1,       n_mu);
-    if n_sig == 1
-        nm = n_mu;
-        sigmafun = @(x, p) p(nm + 1) .* ones(1, numel(x));
+    if isequal(f_best, realmax)
+        disp(['The algorithm did not find a legitimate solution. ' ...
+            'Increase maxiter or use simpler model.']);
     else
-        sigmafun = make_spline_fn(sp_sig_ch, ks, n_mu + 1, n_mu + n_sig);
+        disp('Estimated parameters :');
+        disp(num2str(estimated_par));
+        disp(['- sum of log-likelihoods) : ' num2str(f_best)]);
     end
 
-    % ------------------------------------------------------------------ %
-    %  Assemble options struct (preserves original field names and values) %
-    % ------------------------------------------------------------------ %
-    opts_out.solver        = o.solver;          % keep user's original string
-    opts_out.spline        = {sp_mu_ch, sp_sig_ch};
-    opts_out.l             = o.l;
-    opts_out.r             = o.r;
-    opts_out.nknots        = [n_mu, n_sig];
-    opts_out.knots         = o.knots;
-    opts_out.lb            = o.lb;
-    opts_out.ub            = o.ub;
-    opts_out.search_agents = o.search_agents;
-    opts_out.maxiter       = o.maxiter;
-    opts_out.useparallel   = false;
+    hfig = findobj(0, 'tag', 'optimdlg');
+    if ~isempty(hfig), close(hfig); end
+    tim2 = toc(tim);
 
     % ------------------------------------------------------------------ %
-    %  Assemble result struct (identical to original package layout)       %
+    %  Assemble result struct - IDENTICAL to original                      %
     % ------------------------------------------------------------------ %
-    result.estimated_par    = par(:)';
-    result.negloglik        = nll;
-    result.datarange        = [min(clean), max(clean)];
-    result.dt               = dt;
-    result.mufun            = mufun;
-    result.sigmafun         = sigmafun;
-    result.computation_time = tsec;
-    result.knots            = {km, ks};
-    result.options          = opts_out;
+    if ~parametric
+        if any(sigma(fine_mesh, estimated_par) < 0)
+            error('euler_reconstruction:sigma', ...
+                'Fitted sigma has negative values. Refit or use higher lower bounds.');
+        end
+
+        if strcmp(spline_sig, 'Approximate')
+            % Re-evaluate with SCS for accurate NLL
+            [costSCS, mu, sigma] = loc_euler_cost_spline( ...
+                X0, X, dt, knots, index_mu, spline_mu, 'SCS');
+            f_best = costSCS(estimated_par);
+            fprintf('f_best (real)= %g\n', f_best);
+        end
+
+        % Post-process Q spline handles - IDENTICAL to original post-processing
+        m = options.nknots(1);
+        if isequal(spline_mu, 'Q')
+            if m == 1
+                mu = @(x, par) par(1:m) + zeros(size(x));
+            else
+                km_loc = knots(1:m);
+                mu = @(x, par) ppval(spline(km_loc, par(1:m)), x);
+            end
+        end
+        if isequal(spline_sig, 'Q')
+            n_sig_k = options.nknots(2);
+            if n_sig_k == 1
+                sigma = @(x, par) par(m+1:end) + zeros(size(x));
+            else
+                ks_loc = knots(m+1:end);
+                sigma = @(x, par) ppval(spline(ks_loc, par(m+1:end)), x);
+            end
+        end
+
+        result = struct( ...
+            'estimated_par',    estimated_par, ...
+            'negloglik',        f_best, ...
+            'datarange',        [min(data, [], 'omitnan'), max(data, [], 'omitnan')], ...
+            'dt',               dt, ...
+            'mufun',            mu, ...
+            'sigmafun',         sigma, ...
+            'costfun',          costfun, ...     % present in original for non-parametric
+            'computation_time', tim2, ...
+            'knots',            {{knots(index_mu), knots(~index_mu)}}, ...
+            'options',          options);
+
+        if options.zscore
+            result = shared.back_ztransform(result);
+        end
+
+    else  % parametric
+        if ~strcmp(options.solver, 'fitnlm')
+            STD1 = options.sigma(fine_mesh, estimated_par);
+            if any(STD1 < 0)
+                error('euler_reconstruction:sigma', ...
+                    'Fitted sigma has negative values. Refit or use higher lower bounds.');
+            end
+            if numel(STD1) == 1
+                options.sigma = @(x, par) zeros(size(x)) + options.sigma(x, par);
+            end
+        end
+        result = struct( ...
+            'estimated_par',    estimated_par, ...
+            'negloglik',        f_best, ...
+            'datarange',        [min(data, [], 'omitnan'), max(data, [], 'omitnan')], ...
+            'dt',               dt, ...
+            'mufun',            options.mu, ...
+            'sigmafun',         options.sigma, ...
+            'computation_time', tim2, ...
+            'knots',            [], ...
+            'options',          options);
+    end
 end
 
+
 % ======================================================================= %
-%  Local helpers                                                           %
+%  Local helpers                                                            %
 % ======================================================================= %
 
-function c = orig2mex_sp(ch)
-% Map original single-char spline code to langevin_mex lowercase code.
+function c = loc_sp_to_mex(ch)
+% Map original spline char to langevin_mex lowercase code.
     switch upper(ch)
-        case 'L',               c = 'l';
-        case {'C','Q','S'},     c = 'c';   % Q (order-3 B-spline) → cubic
-        case 'P',               c = 'p';
-        otherwise,              c = 'c';
+        case 'L',           c = 'l';
+        case {'C', 'S'},    c = 'c';
+        case 'Q',           c = 'q';
+        case 'P',           c = 'p';
+        otherwise,          c = 'c';
     end
 end
 
-function s = orig2mex_solver(solver)
-% Map original solver names to langevin_mex solver names.
-    switch lower(solver)
-        case {'fmincon','ps','fminunc'},  s = 'slsqp';
-        case {'gwo'},                     s = 'isres';
-        case {'lbfgs'},                   s = 'lbfgs';
-        case {'isres'},                   s = 'isres';
-        case {'slsqp'},                   s = 'slsqp';
-        otherwise,                        s = 'slsqp';
-    end
-end
 
-function fn = make_spline_fn(sp_ch, knots, i1, i2)
-% Build an @(x, par) evaluation handle for a spline segment.
-% Uses MATLAB's native interpolation so it matches the original's function
-% handles for plotting and downstream use.
-    switch upper(sp_ch)
-        case 'L'
-            fn = @(x, p) interp1(knots, p(i1:i2), x(:)', 'linear', 'extrap');
-        case 'P'
-            if numel(knots) == 1
-                fn = @(x, p) p(i1) .* ones(1, numel(x));
-            else
-                fn = @(x, p) ppval(pchip(knots, p(i1:i2)), x(:)');
-            end
-        otherwise  % 'C', 'Q', or anything else → cubic spline
-            if numel(knots) == 1
-                fn = @(x, p) p(i1) .* ones(1, numel(x));
-            else
-                fn = @(x, p) ppval(spline(knots, p(i1:i2)), x(:)');
-            end
-    end
-end
+function [costfun, mu, sigma] = loc_euler_cost_spline(X0, X, dt, knots, index_mu, sp_mu, sp_sig)
+% Build MATLAB-native cost/mu/sigma for spline models.
+% This is the original Create_Euler_Cost_Spline, kept local.
 
-function o = parse_opts(args)
-% Parse a varargin cell of name-value pairs. All keys are case-insensitive.
-    o.nknots        = [8 8];
-    o.knots         = [];
-    o.spline        = 'CC';
-    o.l             = [];
-    o.r             = [];
-    o.lb            = [];
-    o.ub            = [];
-    o.solver        = 'fmincon';
-    o.search_agents = 1;
-    o.maxiter       = 10000;
-    o.ftol          = 1e-9;
-    o.mu               = [];
-    o.sigma            = [];
-    o.reconst_fraction = [];
-
-    i = 1;
-    while i <= length(args) - 1
-        key = args{i};
-        if ~(ischar(key) || isstring(key)), i = i + 1; continue; end
-        key = lower(char(key));
-        val = args{i + 1};
-        switch key
-            case 'nknots',                         o.nknots        = val;
-            case 'knots',                          o.knots         = val;
-            case 'spline',                         o.spline        = char(val);
-            case {'l','left'},                     o.l             = val;
-            case {'r','right'},                    o.r             = val;
-            case 'lb',                             o.lb            = val;
-            case 'ub',                             o.ub            = val;
-            case 'solver',                         o.solver        = char(val);
-            case {'search_agents','nstarts'},      o.search_agents = val;
-            case 'maxiter',                        o.maxiter       = val;
-            case 'ftol',                           o.ftol          = val;
-            case 'mu',                             o.mu               = val;
-            case 'sigma',                          o.sigma            = val;
-            case 'reconst_fraction',               o.reconst_fraction = val;
-            case {'useparallel','zscore', ...
-                  'prev','prev_range','npars', ...
-                  'gradient_fun','hessian_fun', ...
-                  'solveroptions','transform'}
-                % silently ignored — not applicable to C++ backend
-        end
-        i = i + 2;
-    end
-
-    % Normalise nknots to a 2-element row vector
-    if isscalar(o.nknots)
-        o.nknots = [o.nknots, o.nknots];
-    end
-end
-
-% ======================================================================= %
-%  Parametric-mode fitting (mu/sigma function handles)                     %
-% ======================================================================= %
-
-function result = euler_reconstruction_parametric(data, dt, o)
-    t_start = tic;
-
-    % Infer parameter count from bounds
-    if ~isempty(o.lb)
-        n_par = numel(o.lb);
-    elseif ~isempty(o.ub)
-        n_par = numel(o.ub);
-    else
-        error('euler_reconstruction:parametric', ...
-            'Parametric mode requires ''lb'' and/or ''ub'' to determine parameter dimension.');
-    end
-    lb_v = o.lb(:)'; if isempty(lb_v), lb_v = -inf(1, n_par); end
-    ub_v = o.ub(:)'; if isempty(ub_v), ub_v =  inf(1, n_par); end
-
-    % Build consecutive data pairs, skipping NaN transitions
-    if ~isempty(o.reconst_fraction)
-        frac = o.reconst_fraction;
-        sp   = sample_stratified(data(:)', frac(1), frac(2));
-        x0_p = sp(1:2:end);
-        x1_p = sp(2:2:end);
-    else
-        raw      = data(:)';
-        ok       = ~isnan(raw);
-        pair_ok  = ok(1:end-1) & ok(2:end);
-        x0_p = raw(1:end-1); x0_p = x0_p(pair_ok);
-        x1_p = raw(2:end);   x1_p = x1_p(pair_ok);
-    end
-
-    mu_fn  = o.mu;
-    sig_fn = o.sigma;
-    nll_fn = @(par) euler_nll(par, x0_p, x1_p, dt, mu_fn, sig_fn);
-
-    safe_maxiter = min(o.maxiter, 1e8);
-    if ~isfinite(o.maxiter) || o.maxiter >= realmax/2, safe_maxiter = 1e8; end
-
-    fmc_opts = optimoptions('fmincon', ...
-        'Display',                 'off', ...
-        'MaxFunctionEvaluations',  round(safe_maxiter), ...
-        'FunctionTolerance',       o.ftol, ...
-        'OptimalityTolerance',     o.ftol);
-
-    n_starts = max(1, round(o.search_agents));
-    mid = (lb_v + ub_v) / 2;  mid(~isfinite(mid)) = 0;
-    best_nll = Inf;  best_par = mid;
-
-    for k = 1:n_starts
-        if k == 1
-            par0 = mid;
+    function cost = ffun(par, X0, X, dt, sqrtdt, sigma, mu)
+        STD1 = sigma(X0, par);
+        if all(isnan(STD1) | STD1 > 0)
+            cost = loc_euler_likelihood(X, X0, mu(X0, par), STD1, dt, sqrtdt);
         else
-            r    = rand(1, n_par);
-            par0 = lb_v + r .* (ub_v - lb_v);
-            inf_mask = ~isfinite(par0);
-            par0(inf_mask) = randn(1, sum(inf_mask));
-        end
-        try
-            [p_k, f_k] = fmincon(nll_fn, par0, [], [], [], [], lb_v, ub_v, [], fmc_opts);
-            if f_k < best_nll
-                best_nll = f_k;  best_par = p_k;
-            end
-        catch
+            cost = realmax;
         end
     end
 
-    tsec = toc(t_start);
+    function cost = ffun_approx(par, X0, X, dt, sqrtdt, sigma, mu, testsigma)
+        if all(isnan(X0) | testsigma(X0, par) > 0)
+            cost = loc_euler_likelihood(X, X0, mu(X0, par), sigma(X0, par), dt, sqrtdt);
+        else
+            cost = realmax;
+        end
+    end
 
-    clean_all = data(:);  clean_all = clean_all(~isnan(clean_all));
+    index_sigma = ~index_mu;
+    if sum(index_mu)    == 1, sp_mu  = 'constant'; end
+    if sum(index_sigma) == 1, sp_sig = 'constant'; end
 
-    opts_out.solver        = o.solver;
-    opts_out.spline        = {};
-    opts_out.l             = o.l;
-    opts_out.r             = o.r;
-    opts_out.nknots        = [];
-    opts_out.knots         = [];
-    opts_out.lb            = o.lb;
-    opts_out.ub            = o.ub;
-    opts_out.search_agents = o.search_agents;
-    opts_out.maxiter       = o.maxiter;
-    opts_out.useparallel   = false;
+    knots_mu  = knots(index_mu);
+    knots_sig = knots(index_sigma);
+    sqrtdt    = sqrt(dt);
 
-    result.estimated_par    = best_par(:)';
-    result.negloglik        = best_nll;
-    result.datarange        = [min(clean_all), max(clean_all)];
-    result.dt               = dt;
-    result.mufun            = mu_fn;
-    result.sigmafun         = sig_fn;
-    result.computation_time = tsec;
-    result.knots            = {};
-    result.options          = opts_out;
+    switch sp_mu
+        case 'L'
+            mu = @(x, par) interp1(knots_mu, par(index_mu), x);
+        case 'Q'
+            mu = @(x, par) fnval(spapi(3, knots_mu, par(index_mu)), x);
+        case 'C'
+            mu = @(x, par) ppval(spline(knots_mu, par(index_mu)), x);
+        case 'P'
+            mu = @(x, par) ppval(pchip(knots_mu, par(index_mu)), x);
+        case {'SCS', 'Approximate'}
+            mu = @(x, par) ppval(csaps(knots_mu, par(index_mu)), x);
+        case 'constant'
+            mu = @(x, par) par(index_mu) + zeros(size(x));
+        otherwise
+            error('euler_reconstruction:spline', ...
+                'Spline type of mu ''%s'' is not supported.', sp_mu);
+    end
+
+    switch sp_sig
+        case 'constant'
+            sigma   = @(x, par) par(index_sigma) + zeros(size(x));
+            costfun = @(par) loc_euler_likelihood(X, X0, mu(X0, par), par(index_sigma), dt, sqrtdt);
+        case 'L'
+            sigma   = @(x, par) interp1(knots_sig, par(index_sigma), x);
+            costfun = @(par) loc_euler_likelihood(X, X0, mu(X0, par), sigma(X0, par), dt, sqrtdt);
+        case 'Q'
+            sigma   = @(x, par) fnval(spapi(3, knots_sig, par(index_sigma)), x);
+            costfun = @(par) ffun(par, X0, X, dt, sqrtdt, sigma, mu);
+        case 'C'
+            sigma   = @(x, par) ppval(spline(knots_sig, par(index_sigma)), x);
+            costfun = @(par) ffun(par, X0, X, dt, sqrtdt, sigma, mu);
+        case 'P'
+            sigma   = @(x, par) ppval(pchip(knots_sig, par(index_sigma)), x);
+            costfun = @(par) loc_euler_likelihood(X, X0, mu(X0, par), sigma(X0, par), dt, sqrtdt);
+        case 'Approximate'
+            sigma        = @(x, par) ppval(csaps(knots_sig, par(index_sigma)), x);
+            sigma_linear = @(x, par) interp1(knots_sig, par(index_sigma), x);
+            mu_linear    = @(x, par) interp1(knots_mu,  par(index_mu),    x);
+            costfun      = @(par) ffun_approx(par, X0, X, dt, sqrtdt, sigma_linear, mu_linear, sigma);
+        case 'SCS'
+            sigma   = @(x, par) ppval(csaps(knots_sig, par(index_sigma)), x);
+            costfun = @(par) ffun(par, X0, X, dt, sqrtdt, sigma, mu);
+        otherwise
+            error('euler_reconstruction:spline', ...
+                'Spline type of sigma ''%s'' is not supported.', sp_sig);
+    end
 end
 
-function nll = euler_nll(par, x0, x1, dt, mu_fn, sig_fn)
-    par   = par(:)';
-    mu_v  = mu_fn(x0, par);
-    sig_v = sig_fn(x0, par);
-    sig_v = max(abs(sig_v), 1e-300);
-    nll   = 0.5 * sum(log(2*pi*dt*sig_v.^2) + ((x1 - x0 - mu_v*dt) ./ (sig_v*sqrt(dt))).^2);
+
+function cost = loc_euler_likelihood(X, X0, mu, sigma, dt, sqrtdt)
+% Base Euler log-likelihood - IDENTICAL to original.
+    mu1    = X0 + mu .* dt;
+    sigma1 = sigma .* sqrtdt;
+    z      = (X - mu1) ./ sigma1;
+    L      = -0.5 .* z .* z - log(sqrt(2 .* pi) .* sigma1);
+    cost   = -sum(L, 'omitnan');
+end
+
+
+function costfun = loc_euler_cost_parametric(X0, X, dt, mu, sigma, gradient_fun)
+% Parametric cost function - IDENTICAL to original.
+
+    function [cost, g_cost] = cost_with_grad(par, X0, X, dt, sqrtdt, mu, sigma, gradient_fun)
+        STD1 = sigma(X0, par);
+        cost = -sum(-0.5 .* (log(2 .* pi .* dt .* STD1.^2) + ...
+            ((X - X0 - mu(X0, par) .* dt) ./ (STD1 .* sqrtdt)).^2), 'omitnan');
+        if nargout > 1
+            cpar   = num2cell(par);
+            g_cost = -sum(gradient_fun(X0, X, dt, cpar{:}), 2, 'omitnan');
+        end
+    end
+
+    function cost = cost_wo_grad(par, X0, X, dt, sqrtdt, mu, sigma)
+        STD1 = sigma(X0, par);
+        cost = -sum(-0.5 .* (log(2 .* pi .* dt .* STD1.^2) + ...
+            ((X - X0 - mu(X0, par) .* dt) ./ (STD1 .* sqrtdt)).^2), 'omitnan');
+    end
+
+    sqrtdt = sqrt(dt);
+    if isempty(gradient_fun)
+        costfun = @(par) cost_wo_grad(par, X0, X, dt, sqrtdt, mu, sigma);
+    else
+        costfun = @(par) cost_with_grad(par, X0, X, dt, sqrtdt, mu, sigma, gradient_fun);
+    end
 end
